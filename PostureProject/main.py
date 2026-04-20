@@ -249,11 +249,42 @@ def update_bad_posture_duration(current_status, bad_start_time, current_time):
     return bad_duration_sec, bad_start_time
 
 
-def evaluate_risk_level(bad_duration_sec: float) -> str:
-    if bad_duration_sec >= 20.0:
+def compute_severity(features, calib_state):
+    """
+    Computes posture severity (LOW, MEDIUM, HIGH) based on how far 
+    current angles deviate from baseline angles.
+    """
+    neck_dev = max(0, features["neck_angle"] - calib_state.get("base_neck", 10.0))
+    spine_dev = max(0, features["spine_angle"] - calib_state.get("base_spine", 5.0))
+    side_lean_dev = max(0, abs(features["side_lean_angle"]) - calib_state.get("base_spine", 5.0))
+    
+    total_dev = neck_dev + spine_dev + side_lean_dev
+    
+    if total_dev > 30:
         return "HIGH"
-    if bad_duration_sec >= 8.0:
+    elif total_dev > 15:
         return "MEDIUM"
+    else:
+        return "LOW"
+
+
+def evaluate_risk_level(bad_duration_sec: float, severity: str) -> str:
+    """
+    Combines duration of bad posture and its severity to determine overall risk.
+    """
+    if bad_duration_sec == 0:
+        return "LOW"
+        
+    if severity == "HIGH":
+        if bad_duration_sec >= 5.0: return "HIGH"
+        if bad_duration_sec >= 2.0: return "MEDIUM"
+    elif severity == "MEDIUM":
+        if bad_duration_sec >= 10.0: return "HIGH"
+        if bad_duration_sec >= 5.0: return "MEDIUM"
+    else: # LOW severity
+        if bad_duration_sec >= 20.0: return "HIGH"
+        if bad_duration_sec >= 10.0: return "MEDIUM"
+        
     return "LOW"
 
 
@@ -265,6 +296,7 @@ def draw_posture_overlay(
     status,
     bad_duration_sec,
     risk_level,
+    severity,
     calib_state,
 ) -> None:
     shoulder_mid = tuple(map(int, features["shoulder_mid"]))
@@ -301,7 +333,7 @@ def draw_posture_overlay(
         overlay_lines.append(f"Posture status: {status_text}")
     else:
         overlay_lines.append(f"Baseline Neck: {calib_state['base_neck']:.1f} | Spine: {calib_state['base_spine']:.1f}")
-        overlay_lines.append(f"Posture status: {status_text}")
+        overlay_lines.append(f"Posture status: {status_text} (Severity: {severity})")
         overlay_lines.append(f"Bad posture time: {bad_duration_sec:.1f} s")
         overlay_lines.append(f"Risk level: {risk_level}")
 
@@ -396,12 +428,14 @@ def main() -> None:
                     status = "CALIBRATING"
                     bad_duration_sec = 0.0
                     risk_level = "LOW"
+                    severity = "LOW"
                 else:
                     status = classify_posture(view_mode, features, calib_state)
+                    severity = compute_severity(features, calib_state)
                     bad_duration_sec, bad_start_time = update_bad_posture_duration(
                         status, bad_start_time, current_time
                     )
-                    risk_level = evaluate_risk_level(bad_duration_sec)
+                    risk_level = evaluate_risk_level(bad_duration_sec, severity)
                     
                 draw_posture_overlay(
                     frame,
@@ -411,6 +445,7 @@ def main() -> None:
                     status,
                     bad_duration_sec,
                     risk_level,
+                    severity,
                     calib_state
                 )
 
@@ -425,6 +460,7 @@ def main() -> None:
                         f"{features['spine_angle']:.1f} deg | "
                         f"Lean: {features['lean_direction']} | "
                         f"Posture: {status} | "
+                        f"Severity: {severity} | "
                         f"Bad Time: {bad_duration_sec:.1f} s | "
                         f"Risk: {risk_level}"
                     )
