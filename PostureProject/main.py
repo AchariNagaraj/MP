@@ -135,43 +135,94 @@ def detect_camera_view(shoulder_width, frame_width):
     return "FRONT" if shoulder_ratio >= 0.14 else "SIDE"
 
 
-def classify_posture_front(neck_angle, spine_angle, shoulder_diff):
+def update_calibration(features, calib_state, current_time):
     """
-    Classifies posture based on defined thresholds:
-    - BAD if any angle/diff is severely out of alignment
-    - MODERATE if any angle/diff is slightly out of alignment
-    - GOOD if all are within healthy ranges
+    Collects baseline posture angles during the initial calibration phase.
     """
-    if neck_angle > 25 or spine_angle > 20 or shoulder_diff > 40:
-        return "BAD"
-    elif neck_angle > 15 or spine_angle > 10 or shoulder_diff > 20:
-        return "MODERATE"
+    if not calib_state["is_calibrating"]:
+        return False
+        
+    if current_time - calib_state["start_time"] < calib_state["duration"]:
+        calib_state["neck_samples"].append(features["neck_angle"])
+        calib_state["spine_samples"].append(features["spine_angle"])
+        return True
     else:
-        return "GOOD"
+        if calib_state["neck_samples"]:
+            calib_state["base_neck"] = sum(calib_state["neck_samples"]) / len(calib_state["neck_samples"])
+        if calib_state["spine_samples"]:
+            calib_state["base_spine"] = sum(calib_state["spine_samples"]) / len(calib_state["spine_samples"])
+        calib_state["is_calibrating"] = False
+        return False
 
 
-def classify_posture_side(spine_angle):
+def classify_posture_front(neck_angle, spine_angle, shoulder_diff, calib_state):
     """
-    Side-view rules:
-    - Ignore neck angle as requested
-    - Use shoulder-to-hip alignment (spine angle) only
+    Front-view logic using dynamic thresholds and hysteresis.
     """
-    if spine_angle > 12:
-        return "BAD"
-    elif spine_angle > 7:
-        return "MODERATE"
+    margin = 0
+    if calib_state["prev_status"] == "GOOD":
+        margin = 3  # Allow slightly worse posture before switching to MODERATE/BAD
+    elif calib_state["prev_status"] == "BAD":
+        margin = -3 # Require significantly better posture to recover to GOOD/MODERATE
+
+    base_neck = calib_state["base_neck"]
+    base_spine = calib_state["base_spine"]
+    base_shoulder = calib_state["base_shoulder"]
+
+    mod_neck = base_neck + 5 + margin
+    bad_neck = base_neck + 15 + margin
+    
+    mod_spine = base_spine + 5 + margin
+    bad_spine = base_spine + 15 + margin
+    
+    mod_shoulder = base_shoulder + 10 + (margin * 2)
+    bad_shoulder = base_shoulder + 30 + (margin * 2)
+
+    if neck_angle > bad_neck or spine_angle > bad_spine or shoulder_diff > bad_shoulder:
+        status = "BAD"
+    elif neck_angle > mod_neck or spine_angle > mod_spine or shoulder_diff > mod_shoulder:
+        status = "MODERATE"
     else:
-        return "GOOD"
+        status = "GOOD"
+        
+    calib_state["prev_status"] = status
+    return status
 
 
-def classify_posture(view_mode, features):
+def classify_posture_side(spine_angle, calib_state):
+    """
+    Side-view logic using dynamic thresholds and hysteresis.
+    """
+    margin = 0
+    if calib_state["prev_status"] == "GOOD":
+        margin = 3
+    elif calib_state["prev_status"] == "BAD":
+        margin = -3
+        
+    base_spine = calib_state["base_spine"]
+    mod_spine = base_spine + 5 + margin
+    bad_spine = base_spine + 10 + margin
+    
+    if spine_angle > bad_spine:
+        status = "BAD"
+    elif spine_angle > mod_spine:
+        status = "MODERATE"
+    else:
+        status = "GOOD"
+        
+    calib_state["prev_status"] = status
+    return status
+
+
+def classify_posture(view_mode, features, calib_state):
     if view_mode == "FRONT":
         return classify_posture_front(
             features["neck_angle"],
             features["spine_angle"],
             features["shoulder_alignment"],
+            calib_state
         )
-    return classify_posture_side(features["spine_angle"])
+    return classify_posture_side(features["spine_angle"], calib_state)
 
 
 def smooth_value(history: deque, value: float) -> float:
@@ -214,6 +265,7 @@ def draw_posture_overlay(
     status,
     bad_duration_sec,
     risk_level,
+    calib_state,
 ) -> None:
     shoulder_mid = tuple(map(int, features["shoulder_mid"]))
     hip_mid = tuple(map(int, features["hip_mid"]))
@@ -224,12 +276,17 @@ def draw_posture_overlay(
     cv2.line(frame, shoulder_mid, keypoints["nose"], (0, 255, 255), 2)
     cv2.line(frame, shoulder_mid, hip_mid, (255, 255, 0), 2)
 
-    if status == "GOOD":
-        color = (0, 255, 0)      # Green in BGR
-    elif status == "MODERATE":
-        color = (0, 255, 255)    # Yellow in BGR
+    if calib_state["is_calibrating"]:
+        status_text = "CALIBRATING..."
+        color = (0, 165, 255) # Orange in BGR
     else:
-        color = (0, 0, 255)      # Red in BGR
+        status_text = status
+        if status == "GOOD":
+            color = (0, 255, 0)      # Green in BGR
+        elif status == "MODERATE":
+            color = (0, 255, 255)    # Yellow in BGR
+        else:
+            color = (0, 0, 255)      # Red in BGR
 
     overlay_lines = [
         f"View: {view_mode}",
@@ -238,16 +295,25 @@ def draw_posture_overlay(
         f"Shoulder y-diff: {features['shoulder_alignment']:.1f} px",
         f"Spine angle (smoothed): {features['spine_angle']:.1f} deg",
         f"Lean direction: {features['lean_direction']} ({features['side_lean_angle']:.1f} deg)",
-        f"Posture status: {status}",
-        f"Bad posture time: {bad_duration_sec:.1f} s",
-        f"Risk level: {risk_level}",
     ]
+
+    if calib_state["is_calibrating"]:
+        overlay_lines.append(f"Posture status: {status_text}")
+    else:
+        overlay_lines.append(f"Baseline Neck: {calib_state['base_neck']:.1f} | Spine: {calib_state['base_spine']:.1f}")
+        overlay_lines.append(f"Posture status: {status_text}")
+        overlay_lines.append(f"Bad posture time: {bad_duration_sec:.1f} s")
+        overlay_lines.append(f"Risk level: {risk_level}")
 
     for idx, text in enumerate(overlay_lines):
         y = 30 + idx * 30
-        # Highlight posture and risk lines using status color.
-        text_color = color if idx >= len(overlay_lines) - 2 else (0, 255, 0)
         
+        # Highlight status lines dynamically
+        if calib_state["is_calibrating"]:
+            text_color = color if idx == len(overlay_lines) - 1 else (0, 255, 0)
+        else:
+            text_color = color if idx >= len(overlay_lines) - 3 else (0, 255, 0)
+            
         cv2.putText(
             frame,
             text,
@@ -283,6 +349,17 @@ def main() -> None:
     neck_angle_history = deque(maxlen=7)
     spine_angle_history = deque(maxlen=7)
     bad_start_time = None
+    calib_state = {
+        "is_calibrating": True,
+        "start_time": time.time(),
+        "duration": 5.0, # 5 seconds calibration period
+        "neck_samples": [],
+        "spine_samples": [],
+        "base_neck": 10.0,
+        "base_spine": 5.0,
+        "base_shoulder": 10.0,
+        "prev_status": "GOOD"
+    }
 
     with vision.PoseLandmarker.create_from_options(options) as landmarker:
         while True:
@@ -309,13 +386,23 @@ def main() -> None:
                 features["spine_angle"] = smooth_value(
                     spine_angle_history, features["spine_angle"]
                 )
+                
                 view_mode = detect_camera_view(features["shoulder_width"], frame.shape[1])
-                status = classify_posture(view_mode, features)
                 current_time = time.time()
-                bad_duration_sec, bad_start_time = update_bad_posture_duration(
-                    status, bad_start_time, current_time
-                )
-                risk_level = evaluate_risk_level(bad_duration_sec)
+                
+                is_calibrating = update_calibration(features, calib_state, current_time)
+                
+                if is_calibrating:
+                    status = "CALIBRATING"
+                    bad_duration_sec = 0.0
+                    risk_level = "LOW"
+                else:
+                    status = classify_posture(view_mode, features, calib_state)
+                    bad_duration_sec, bad_start_time = update_bad_posture_duration(
+                        status, bad_start_time, current_time
+                    )
+                    risk_level = evaluate_risk_level(bad_duration_sec)
+                    
                 draw_posture_overlay(
                     frame,
                     keypoints,
@@ -324,21 +411,23 @@ def main() -> None:
                     status,
                     bad_duration_sec,
                     risk_level,
+                    calib_state
                 )
 
-                print(
-                    f"View: {view_mode} | "
-                    "Neck angle: "
-                    f"{features['neck_angle']:.1f} deg | "
-                    "Shoulder y-diff: "
-                    f"{features['shoulder_alignment']:.1f} px | "
-                    "Spine angle: "
-                    f"{features['spine_angle']:.1f} deg | "
-                    f"Lean: {features['lean_direction']} ({features['side_lean_angle']:.1f} deg) | "
-                    f"Posture: {status} | "
-                    f"Bad Time: {bad_duration_sec:.1f} s | "
-                    f"Risk: {risk_level}"
-                )
+                if not is_calibrating:
+                    print(
+                        f"View: {view_mode} | "
+                        "Neck angle: "
+                        f"{features['neck_angle']:.1f} deg | "
+                        "Shoulder y-diff: "
+                        f"{features['shoulder_alignment']:.1f} px | "
+                        "Spine angle: "
+                        f"{features['spine_angle']:.1f} deg | "
+                        f"Lean: {features['lean_direction']} | "
+                        f"Posture: {status} | "
+                        f"Bad Time: {bad_duration_sec:.1f} s | "
+                        f"Risk: {risk_level}"
+                    )
 
             cv2.imshow("Real-Time Posture Analysis", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
