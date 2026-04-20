@@ -69,6 +69,16 @@ def angle_from_vertical(point_a, point_b) -> float:
     return math.degrees(math.atan2(abs(dx), abs(dy) + 1e-6))
 
 
+def signed_angle_from_vertical(point_a, point_b) -> float:
+    """
+    Computes angle from vertical. Positive means point_b is to the right of point_a.
+    Negative means point_b is to the left of point_a.
+    """
+    dx = point_b[0] - point_a[0]
+    dy = -(point_b[1] - point_a[1]) # Y-axis increases downwards, so negate dy
+    return math.degrees(math.atan2(dx, dy + 1e-6))
+
+
 def extract_posture_keypoints(landmarks, frame_shape):
     return {
         "nose": landmark_to_pixel(landmarks[NOSE_IDX], frame_shape),
@@ -87,15 +97,41 @@ def compute_posture_features(keypoints):
     shoulder_alignment = abs(
         keypoints["left_shoulder"][1] - keypoints["right_shoulder"][1]
     )
-    spine_angle = angle_from_vertical(hip_mid, shoulder_mid)
+    
+    side_lean_angle = signed_angle_from_vertical(hip_mid, shoulder_mid)
+    spine_angle = abs(side_lean_angle) # absolute magnitude for classification
+    
+    if side_lean_angle > 5:
+        lean_direction = "RIGHT LEAN"
+    elif side_lean_angle < -5:
+        lean_direction = "LEFT LEAN"
+    else:
+        lean_direction = "CENTERED"
 
     return {
         "neck_angle": neck_angle,
         "shoulder_alignment": shoulder_alignment,
         "spine_angle": spine_angle,
+        "side_lean_angle": side_lean_angle,
+        "lean_direction": lean_direction,
         "shoulder_mid": shoulder_mid,
         "hip_mid": hip_mid,
     }
+
+
+def classify_posture(neck_angle, spine_angle, shoulder_diff):
+    """
+    Classifies posture based on defined thresholds:
+    - BAD if any angle/diff is severely out of alignment
+    - MODERATE if any angle/diff is slightly out of alignment
+    - GOOD if all are within healthy ranges
+    """
+    if neck_angle > 25 or spine_angle > 20 or shoulder_diff > 40:
+        return "BAD"
+    elif neck_angle > 15 or spine_angle > 10 or shoulder_diff > 20:
+        return "MODERATE"
+    else:
+        return "GOOD"
 
 
 def draw_posture_overlay(frame, keypoints, features) -> None:
@@ -108,22 +144,40 @@ def draw_posture_overlay(frame, keypoints, features) -> None:
     cv2.line(frame, shoulder_mid, keypoints["nose"], (0, 255, 255), 2)
     cv2.line(frame, shoulder_mid, hip_mid, (255, 255, 0), 2)
 
+    status = classify_posture(
+        features["neck_angle"],
+        features["spine_angle"],
+        features["shoulder_alignment"]
+    )
+
+    if status == "GOOD":
+        color = (0, 255, 0)      # Green in BGR
+    elif status == "MODERATE":
+        color = (0, 255, 255)    # Yellow in BGR
+    else:
+        color = (0, 0, 255)      # Red in BGR
+
     overlay_lines = [
         f"Neck angle: {features['neck_angle']:.1f} deg",
         f"Shoulder y-diff: {features['shoulder_alignment']:.1f} px",
         f"Spine angle: {features['spine_angle']:.1f} deg",
-        "Posture status: values only",
+        f"Lean direction: {features['lean_direction']} ({features['side_lean_angle']:.1f} deg)",
+        f"Posture status: {status}",
     ]
 
     for idx, text in enumerate(overlay_lines):
         y = 30 + idx * 30
+        
+        # Only use the dynamic color for the last line (Posture status)
+        text_color = color if idx == len(overlay_lines) - 1 else (0, 255, 0)
+        
         cv2.putText(
             frame,
             text,
             (10, y),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.7,
-            (0, 255, 0),
+            text_color,
             2,
             cv2.LINE_AA,
         )
@@ -177,7 +231,8 @@ def main() -> None:
                     "Shoulder y-diff: "
                     f"{features['shoulder_alignment']:.1f} px | "
                     "Spine angle: "
-                    f"{features['spine_angle']:.1f} deg"
+                    f"{features['spine_angle']:.1f} deg | "
+                    f"Lean: {features['lean_direction']} ({features['side_lean_angle']:.1f} deg)"
                 )
 
             cv2.imshow("Real-Time Posture Analysis", frame)
