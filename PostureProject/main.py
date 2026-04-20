@@ -1,6 +1,8 @@
 import os
 import urllib.request
 import math
+import time
+from collections import deque
 
 import cv2
 import mediapipe as mp
@@ -172,7 +174,47 @@ def classify_posture(view_mode, features):
     return classify_posture_side(features["spine_angle"])
 
 
-def draw_posture_overlay(frame, keypoints, features, view_mode, status) -> None:
+def smooth_value(history: deque, value: float) -> float:
+    history.append(value)
+    return sum(history) / len(history)
+
+
+def update_bad_posture_duration(current_status, bad_start_time, current_time):
+    """
+    Returns:
+    - bad_duration_sec: current continuous BAD duration
+    - updated_bad_start_time
+    """
+    if current_status == "BAD":
+        if bad_start_time is None:
+            bad_start_time = current_time
+        bad_duration_sec = current_time - bad_start_time
+    elif current_status == "GOOD":
+        bad_start_time = None
+        bad_duration_sec = 0.0
+    else:
+        # For MODERATE, keep prior BAD timer state but do not force reset.
+        bad_duration_sec = 0.0 if bad_start_time is None else current_time - bad_start_time
+    return bad_duration_sec, bad_start_time
+
+
+def evaluate_risk_level(bad_duration_sec: float) -> str:
+    if bad_duration_sec >= 20.0:
+        return "HIGH"
+    if bad_duration_sec >= 8.0:
+        return "MEDIUM"
+    return "LOW"
+
+
+def draw_posture_overlay(
+    frame,
+    keypoints,
+    features,
+    view_mode,
+    status,
+    bad_duration_sec,
+    risk_level,
+) -> None:
     shoulder_mid = tuple(map(int, features["shoulder_mid"]))
     hip_mid = tuple(map(int, features["hip_mid"]))
 
@@ -192,18 +234,19 @@ def draw_posture_overlay(frame, keypoints, features, view_mode, status) -> None:
     overlay_lines = [
         f"View: {view_mode}",
         f"Shoulder width: {features['shoulder_width']:.1f} px",
-        f"Neck angle: {features['neck_angle']:.1f} deg",
+        f"Neck angle (smoothed): {features['neck_angle']:.1f} deg",
         f"Shoulder y-diff: {features['shoulder_alignment']:.1f} px",
-        f"Spine angle: {features['spine_angle']:.1f} deg",
+        f"Spine angle (smoothed): {features['spine_angle']:.1f} deg",
         f"Lean direction: {features['lean_direction']} ({features['side_lean_angle']:.1f} deg)",
         f"Posture status: {status}",
+        f"Bad posture time: {bad_duration_sec:.1f} s",
+        f"Risk level: {risk_level}",
     ]
 
     for idx, text in enumerate(overlay_lines):
         y = 30 + idx * 30
-        
-        # Only use the dynamic color for the last line (Posture status)
-        text_color = color if idx == len(overlay_lines) - 1 else (0, 255, 0)
+        # Highlight posture and risk lines using status color.
+        text_color = color if idx >= len(overlay_lines) - 2 else (0, 255, 0)
         
         cv2.putText(
             frame,
@@ -237,6 +280,9 @@ def main() -> None:
 
     print("Webcam opened successfully. Press 'q' to quit.")
     frame_index = 0
+    neck_angle_history = deque(maxlen=7)
+    spine_angle_history = deque(maxlen=7)
+    bad_start_time = None
 
     with vision.PoseLandmarker.create_from_options(options) as landmarker:
         while True:
@@ -257,9 +303,28 @@ def main() -> None:
 
                 keypoints = extract_posture_keypoints(pose_landmarks, frame.shape)
                 features = compute_posture_features(keypoints)
+                features["neck_angle"] = smooth_value(
+                    neck_angle_history, features["neck_angle"]
+                )
+                features["spine_angle"] = smooth_value(
+                    spine_angle_history, features["spine_angle"]
+                )
                 view_mode = detect_camera_view(features["shoulder_width"], frame.shape[1])
                 status = classify_posture(view_mode, features)
-                draw_posture_overlay(frame, keypoints, features, view_mode, status)
+                current_time = time.time()
+                bad_duration_sec, bad_start_time = update_bad_posture_duration(
+                    status, bad_start_time, current_time
+                )
+                risk_level = evaluate_risk_level(bad_duration_sec)
+                draw_posture_overlay(
+                    frame,
+                    keypoints,
+                    features,
+                    view_mode,
+                    status,
+                    bad_duration_sec,
+                    risk_level,
+                )
 
                 print(
                     f"View: {view_mode} | "
@@ -270,7 +335,9 @@ def main() -> None:
                     "Spine angle: "
                     f"{features['spine_angle']:.1f} deg | "
                     f"Lean: {features['lean_direction']} ({features['side_lean_angle']:.1f} deg) | "
-                    f"Posture: {status}"
+                    f"Posture: {status} | "
+                    f"Bad Time: {bad_duration_sec:.1f} s | "
+                    f"Risk: {risk_level}"
                 )
 
             cv2.imshow("Real-Time Posture Analysis", frame)
