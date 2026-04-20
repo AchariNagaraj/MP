@@ -92,6 +92,9 @@ def extract_posture_keypoints(landmarks, frame_shape):
 def compute_posture_features(keypoints):
     shoulder_mid = midpoint(keypoints["left_shoulder"], keypoints["right_shoulder"])
     hip_mid = midpoint(keypoints["left_hip"], keypoints["right_hip"])
+    shoulder_width = abs(
+        keypoints["left_shoulder"][0] - keypoints["right_shoulder"][0]
+    )
 
     neck_angle = angle_from_vertical(shoulder_mid, keypoints["nose"])
     shoulder_alignment = abs(
@@ -114,12 +117,23 @@ def compute_posture_features(keypoints):
         "spine_angle": spine_angle,
         "side_lean_angle": side_lean_angle,
         "lean_direction": lean_direction,
+        "shoulder_width": shoulder_width,
         "shoulder_mid": shoulder_mid,
         "hip_mid": hip_mid,
     }
 
 
-def classify_posture(neck_angle, spine_angle, shoulder_diff):
+def detect_camera_view(shoulder_width, frame_width):
+    """
+    Simple heuristic:
+    - FRONT view when shoulder span is wide enough in image
+    - SIDE view when shoulder span appears narrow
+    """
+    shoulder_ratio = shoulder_width / max(frame_width, 1)
+    return "FRONT" if shoulder_ratio >= 0.14 else "SIDE"
+
+
+def classify_posture_front(neck_angle, spine_angle, shoulder_diff):
     """
     Classifies posture based on defined thresholds:
     - BAD if any angle/diff is severely out of alignment
@@ -134,7 +148,31 @@ def classify_posture(neck_angle, spine_angle, shoulder_diff):
         return "GOOD"
 
 
-def draw_posture_overlay(frame, keypoints, features) -> None:
+def classify_posture_side(spine_angle):
+    """
+    Side-view rules:
+    - Ignore neck angle as requested
+    - Use shoulder-to-hip alignment (spine angle) only
+    """
+    if spine_angle > 12:
+        return "BAD"
+    elif spine_angle > 7:
+        return "MODERATE"
+    else:
+        return "GOOD"
+
+
+def classify_posture(view_mode, features):
+    if view_mode == "FRONT":
+        return classify_posture_front(
+            features["neck_angle"],
+            features["spine_angle"],
+            features["shoulder_alignment"],
+        )
+    return classify_posture_side(features["spine_angle"])
+
+
+def draw_posture_overlay(frame, keypoints, features, view_mode, status) -> None:
     shoulder_mid = tuple(map(int, features["shoulder_mid"]))
     hip_mid = tuple(map(int, features["hip_mid"]))
 
@@ -144,12 +182,6 @@ def draw_posture_overlay(frame, keypoints, features) -> None:
     cv2.line(frame, shoulder_mid, keypoints["nose"], (0, 255, 255), 2)
     cv2.line(frame, shoulder_mid, hip_mid, (255, 255, 0), 2)
 
-    status = classify_posture(
-        features["neck_angle"],
-        features["spine_angle"],
-        features["shoulder_alignment"]
-    )
-
     if status == "GOOD":
         color = (0, 255, 0)      # Green in BGR
     elif status == "MODERATE":
@@ -158,6 +190,8 @@ def draw_posture_overlay(frame, keypoints, features) -> None:
         color = (0, 0, 255)      # Red in BGR
 
     overlay_lines = [
+        f"View: {view_mode}",
+        f"Shoulder width: {features['shoulder_width']:.1f} px",
         f"Neck angle: {features['neck_angle']:.1f} deg",
         f"Shoulder y-diff: {features['shoulder_alignment']:.1f} px",
         f"Spine angle: {features['spine_angle']:.1f} deg",
@@ -223,16 +257,20 @@ def main() -> None:
 
                 keypoints = extract_posture_keypoints(pose_landmarks, frame.shape)
                 features = compute_posture_features(keypoints)
-                draw_posture_overlay(frame, keypoints, features)
+                view_mode = detect_camera_view(features["shoulder_width"], frame.shape[1])
+                status = classify_posture(view_mode, features)
+                draw_posture_overlay(frame, keypoints, features, view_mode, status)
 
                 print(
+                    f"View: {view_mode} | "
                     "Neck angle: "
                     f"{features['neck_angle']:.1f} deg | "
                     "Shoulder y-diff: "
                     f"{features['shoulder_alignment']:.1f} px | "
                     "Spine angle: "
                     f"{features['spine_angle']:.1f} deg | "
-                    f"Lean: {features['lean_direction']} ({features['side_lean_angle']:.1f} deg)"
+                    f"Lean: {features['lean_direction']} ({features['side_lean_angle']:.1f} deg) | "
+                    f"Posture: {status}"
                 )
 
             cv2.imshow("Real-Time Posture Analysis", frame)
