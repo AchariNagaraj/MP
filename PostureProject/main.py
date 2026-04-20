@@ -1,8 +1,11 @@
+from __future__ import annotations
+
 import os
 import urllib.request
 import math
 import time
 from collections import deque
+from typing import Tuple
 
 import cv2
 import mediapipe as mp
@@ -230,6 +233,11 @@ def smooth_value(history: deque, value: float) -> float:
     return sum(history) / len(history)
 
 
+# Angle-based severity: max of smoothed neck, spine, |side lean| (degrees).
+SEVERITY_LOW_MAX = 12.0
+SEVERITY_MEDIUM_MAX = 22.0
+
+
 def update_bad_posture_duration(current_status, bad_start_time, current_time):
     """
     Returns:
@@ -249,43 +257,136 @@ def update_bad_posture_duration(current_status, bad_start_time, current_time):
     return bad_duration_sec, bad_start_time
 
 
-def compute_severity(features, calib_state):
+def compute_severity(features) -> Tuple[str, float]:
     """
-    Computes posture severity (LOW, MEDIUM, HIGH) based on how far 
-    current angles deviate from baseline angles.
+    Severity score = max(smoothed neck, smoothed spine, |smoothed side lean|).
+    Levels: LOW / MEDIUM / HIGH from fixed angle thresholds (degrees).
     """
-    neck_dev = max(0, features["neck_angle"] - calib_state.get("base_neck", 10.0))
-    spine_dev = max(0, features["spine_angle"] - calib_state.get("base_spine", 5.0))
-    side_lean_dev = max(0, abs(features["side_lean_angle"]) - calib_state.get("base_spine", 5.0))
-    
-    total_dev = neck_dev + spine_dev + side_lean_dev
-    
-    if total_dev > 30:
-        return "HIGH"
-    elif total_dev > 15:
-        return "MEDIUM"
+    neck = features["neck_angle"]
+    spine = features["spine_angle"]
+    side_abs = abs(features["side_lean_angle"])
+    severity_score = max(neck, spine, side_abs)
+
+    if severity_score < SEVERITY_LOW_MAX:
+        level = "LOW"
+    elif severity_score < SEVERITY_MEDIUM_MAX:
+        level = "MEDIUM"
     else:
-        return "LOW"
+        level = "HIGH"
+
+    return level, severity_score
 
 
-def evaluate_risk_level(bad_duration_sec: float, severity: str) -> str:
+def evaluate_risk_level(bad_duration_sec: float, severity_level: str) -> str:
     """
-    Combines duration of bad posture and its severity to determine overall risk.
+    Combines sustained BAD posture (seconds) with angle severity.
+    Rules (simple, realistic):
+    - No sustained bad → LOW
+    - Long bad duration → HIGH regardless of severity band
+    - Short duration + HIGH severity → escalate faster
     """
-    if bad_duration_sec == 0:
+    if bad_duration_sec <= 0.0:
         return "LOW"
-        
-    if severity == "HIGH":
-        if bad_duration_sec >= 5.0: return "HIGH"
-        if bad_duration_sec >= 2.0: return "MEDIUM"
-    elif severity == "MEDIUM":
-        if bad_duration_sec >= 10.0: return "HIGH"
-        if bad_duration_sec >= 5.0: return "MEDIUM"
-    else: # LOW severity
-        if bad_duration_sec >= 20.0: return "HIGH"
-        if bad_duration_sec >= 10.0: return "MEDIUM"
-        
+
+    if bad_duration_sec >= 25.0:
+        return "HIGH"
+    if bad_duration_sec >= 15.0:
+        return "HIGH" if severity_level != "LOW" else "MEDIUM"
+
+    if severity_level == "HIGH":
+        if bad_duration_sec >= 3.0:
+            return "HIGH"
+        if bad_duration_sec >= 1.0:
+            return "MEDIUM"
+    elif severity_level == "MEDIUM":
+        if bad_duration_sec >= 10.0:
+            return "HIGH"
+        if bad_duration_sec >= 4.0:
+            return "MEDIUM"
+    else:
+        if bad_duration_sec >= 20.0:
+            return "HIGH"
+        if bad_duration_sec >= 10.0:
+            return "MEDIUM"
+
     return "LOW"
+
+
+def draw_severity_heatmap(
+    frame,
+    keypoints,
+    features,
+    shoulder_mid,
+    hip_mid,
+) -> None:
+    """
+    Region highlights: neck (red), spine (orange), shoulders (yellow imbalance).
+    Intensity scales with local angle / imbalance (0..1 normalized heuristics).
+    """
+    h, w = frame.shape[:2]
+
+    def norm_angle(deg: float, cap: float) -> float:
+        return float(max(0.0, min(1.0, deg / max(cap, 1e-6))))
+
+    neck_i = norm_angle(features["neck_angle"], 35.0)
+    spine_i = norm_angle(features["spine_angle"], 30.0)
+    sh_px = features["shoulder_alignment"]
+    shoulder_i = float(max(0.0, min(1.0, sh_px / 45.0)))
+
+    overlay = frame.copy()
+    alpha = 0.38
+    
+    sm = (int(shoulder_mid[0]), int(shoulder_mid[1]))
+    hm = (int(hip_mid[0]), int(hip_mid[1]))
+
+    if neck_i > 0.08:
+        # Place neck heatmap in the true center of the neck (between nose and shoulder midpoint)
+        nose_pt = keypoints["nose"]
+        true_neck_center = (
+            int((sm[0] + nose_pt[0]) / 2),
+            int((sm[1] + nose_pt[1]) / 2)
+        )
+        r = int(28 + 35 * neck_i)
+        cv2.circle(overlay, true_neck_center, r, (0, 0, 255), -1)
+
+    if spine_i > 0.08:
+        # Use the anatomical center of the torso (midpoint between shoulders and hips)
+        spine_center = (
+            int((sm[0] + hm[0]) / 2),
+            int((sm[1] + hm[1]) / 2)
+        )
+        r = int(35 + 45 * spine_i)
+        cv2.circle(overlay, spine_center, r, (0, 120, 255), -1)
+
+    if shoulder_i > 0.12:
+        r = int(22 + 28 * shoulder_i)
+        cv2.circle(overlay, keypoints["left_shoulder"], r, (0, 255, 255), -1)
+        cv2.circle(overlay, keypoints["right_shoulder"], r, (0, 255, 255), -1)
+
+    cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0, frame)
+
+
+def append_session_log(
+    session_log: list,
+    session_start: float,
+    features: dict,
+    posture: str,
+    severity_level: str,
+    severity_score: float,
+    risk_level: str,
+) -> None:
+    session_log.append(
+        {
+            "time_sec": round(time.time() - session_start, 3),
+            "neck_angle": round(features["neck_angle"], 3),
+            "spine_angle": round(features["spine_angle"], 3),
+            "side_lean_angle": round(features["side_lean_angle"], 3),
+            "posture": posture,
+            "severity": severity_level,
+            "severity_score": round(severity_score, 3),
+            "risk": risk_level,
+        }
+    )
 
 
 def draw_posture_overlay(
@@ -296,7 +397,8 @@ def draw_posture_overlay(
     status,
     bad_duration_sec,
     risk_level,
-    severity,
+    severity_level,
+    severity_score,
     calib_state,
 ) -> None:
     shoulder_mid = tuple(map(int, features["shoulder_mid"]))
@@ -310,41 +412,43 @@ def draw_posture_overlay(
 
     if calib_state["is_calibrating"]:
         status_text = "CALIBRATING..."
-        color = (0, 165, 255) # Orange in BGR
+        color = (0, 165, 255)  # Orange in BGR
     else:
         status_text = status
         if status == "GOOD":
-            color = (0, 255, 0)      # Green in BGR
+            color = (0, 255, 0)  # Green
         elif status == "MODERATE":
-            color = (0, 255, 255)    # Yellow in BGR
+            color = (0, 255, 255)  # Yellow
         else:
-            color = (0, 0, 255)      # Red in BGR
+            color = (0, 0, 255)  # Red
 
     overlay_lines = [
         f"View: {view_mode}",
+        f"Lean: {features['lean_direction']}",
         f"Shoulder width: {features['shoulder_width']:.1f} px",
-        f"Neck angle (smoothed): {features['neck_angle']:.1f} deg",
+        f"Neck (smoothed): {features['neck_angle']:.1f} deg",
+        f"Spine (smoothed): {features['spine_angle']:.1f} deg",
+        f"Side lean (smoothed): {features['side_lean_angle']:.1f} deg",
         f"Shoulder y-diff: {features['shoulder_alignment']:.1f} px",
-        f"Spine angle (smoothed): {features['spine_angle']:.1f} deg",
-        f"Lean direction: {features['lean_direction']} ({features['side_lean_angle']:.1f} deg)",
     ]
 
     if calib_state["is_calibrating"]:
-        overlay_lines.append(f"Posture status: {status_text}")
+        overlay_lines.append(f"Status: {status_text}")
     else:
-        overlay_lines.append(f"Baseline Neck: {calib_state['base_neck']:.1f} | Spine: {calib_state['base_spine']:.1f}")
-        overlay_lines.append(f"Posture status: {status_text} (Severity: {severity})")
+        overlay_lines.append(
+            f"Baseline: neck {calib_state['base_neck']:.1f} | spine {calib_state['base_spine']:.1f}"
+        )
+        overlay_lines.append(
+            f"Posture: {status_text}  |  Severity: {severity_level} ({severity_score:.1f} deg)"
+        )
         overlay_lines.append(f"Bad posture time: {bad_duration_sec:.1f} s")
-        overlay_lines.append(f"Risk level: {risk_level}")
+        overlay_lines.append(f"Risk: {risk_level}")
+
+    highlight_start = len(overlay_lines) - 3 if not calib_state["is_calibrating"] else len(overlay_lines) - 1
 
     for idx, text in enumerate(overlay_lines):
         y = 30 + idx * 30
-        
-        # Highlight status lines dynamically
-        if calib_state["is_calibrating"]:
-            text_color = color if idx == len(overlay_lines) - 1 else (0, 255, 0)
-        else:
-            text_color = color if idx >= len(overlay_lines) - 3 else (0, 255, 0)
+        text_color = color if idx >= highlight_start else (0, 255, 0)
             
         cv2.putText(
             frame,
@@ -379,8 +483,10 @@ def main() -> None:
     print("Webcam opened successfully. Press 'q' to quit.")
     frame_index = 0
     neck_angle_history = deque(maxlen=7)
-    spine_angle_history = deque(maxlen=7)
+    side_lean_history = deque(maxlen=7)
     bad_start_time = None
+    session_start = time.time()
+    session_log: list = []
     calib_state = {
         "is_calibrating": True,
         "start_time": time.time(),
@@ -415,28 +521,54 @@ def main() -> None:
                 features["neck_angle"] = smooth_value(
                     neck_angle_history, features["neck_angle"]
                 )
-                features["spine_angle"] = smooth_value(
-                    spine_angle_history, features["spine_angle"]
+                features["side_lean_angle"] = smooth_value(
+                    side_lean_history, features["side_lean_angle"]
                 )
-                
+                features["spine_angle"] = abs(features["side_lean_angle"])
+                # Recompute lean label from smoothed side angle for display consistency
+                sl = features["side_lean_angle"]
+                if sl > 5:
+                    features["lean_direction"] = "RIGHT"
+                elif sl < -5:
+                    features["lean_direction"] = "LEFT"
+                else:
+                    features["lean_direction"] = "CENTERED"
+
                 view_mode = detect_camera_view(features["shoulder_width"], frame.shape[1])
                 current_time = time.time()
-                
+
                 is_calibrating = update_calibration(features, calib_state, current_time)
-                
+
                 if is_calibrating:
                     status = "CALIBRATING"
                     bad_duration_sec = 0.0
                     risk_level = "LOW"
-                    severity = "LOW"
+                    severity_level = "LOW"
+                    severity_score = 0.0
                 else:
                     status = classify_posture(view_mode, features, calib_state)
-                    severity = compute_severity(features, calib_state)
+                    severity_level, severity_score = compute_severity(features)
                     bad_duration_sec, bad_start_time = update_bad_posture_duration(
                         status, bad_start_time, current_time
                     )
-                    risk_level = evaluate_risk_level(bad_duration_sec, severity)
-                    
+                    risk_level = evaluate_risk_level(bad_duration_sec, severity_level)
+                    draw_severity_heatmap(
+                        frame,
+                        keypoints,
+                        features,
+                        features["shoulder_mid"],
+                        features["hip_mid"],
+                    )
+                    append_session_log(
+                        session_log,
+                        session_start,
+                        features,
+                        status,
+                        severity_level,
+                        severity_score,
+                        risk_level,
+                    )
+
                 draw_posture_overlay(
                     frame,
                     keypoints,
@@ -445,8 +577,9 @@ def main() -> None:
                     status,
                     bad_duration_sec,
                     risk_level,
-                    severity,
-                    calib_state
+                    severity_level,
+                    severity_score,
+                    calib_state,
                 )
 
                 if not is_calibrating:
@@ -460,7 +593,7 @@ def main() -> None:
                         f"{features['spine_angle']:.1f} deg | "
                         f"Lean: {features['lean_direction']} | "
                         f"Posture: {status} | "
-                        f"Severity: {severity} | "
+                        f"Severity: {severity_level} ({severity_score:.1f}) | "
                         f"Bad Time: {bad_duration_sec:.1f} s | "
                         f"Risk: {risk_level}"
                     )
@@ -469,6 +602,7 @@ def main() -> None:
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
+    print(f"Session log entries: {len(session_log)} (list stored in memory during run).")
     cap.release()
     cv2.destroyAllWindows()
 
