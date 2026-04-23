@@ -4,10 +4,12 @@ import os
 import urllib.request
 import math
 import time
+from datetime import datetime
 from collections import deque
 from typing import Tuple
 
 import cv2
+import numpy as np
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
@@ -316,54 +318,343 @@ def draw_severity_heatmap(
     frame,
     keypoints,
     features,
-    shoulder_mid,
-    hip_mid,
+    posture_status: str,
+    severity_level: str,
 ) -> None:
     """
-    Region highlights: neck (red), spine (orange), shoulders (yellow imbalance).
-    Intensity scales with local angle / imbalance (0..1 normalized heuristics).
+    Simple circle-based risk visualization.
     """
-    h, w = frame.shape[:2]
+    if posture_status == "GOOD":
+        return
 
-    def norm_angle(deg: float, cap: float) -> float:
-        return float(max(0.0, min(1.0, deg / max(cap, 1e-6))))
+    shoulder_mid = (
+        int(features["shoulder_mid"][0]),
+        int(features["shoulder_mid"][1]),
+    )
+    hip_mid = (
+        int(features["hip_mid"][0]),
+        int(features["hip_mid"][1]),
+    )
+    nose = keypoints["nose"]
+    neck_point = (
+        int((shoulder_mid[0] + nose[0]) / 2),
+        int((shoulder_mid[1] + nose[1]) / 2),
+    )
+    spine_point = (
+        int((shoulder_mid[0] + hip_mid[0]) / 2),
+        int((shoulder_mid[1] + hip_mid[1]) / 2),
+    )
 
-    neck_i = norm_angle(features["neck_angle"], 35.0)
-    spine_i = norm_angle(features["spine_angle"], 30.0)
-    sh_px = features["shoulder_alignment"]
-    shoulder_i = float(max(0.0, min(1.0, sh_px / 45.0)))
+    # 1. Per-region severity (0–1)
+    neck_s     = min(1.0, features["neck_angle"]         / 30.0)
+    spine_s    = min(1.0, features["spine_angle"]        / 30.0)
+    shoulder_s = min(1.0, features["shoulder_alignment"] / 50.0)
 
-    overlay = frame.copy()
-    alpha = 0.38
-    
-    sm = (int(shoulder_mid[0]), int(shoulder_mid[1]))
-    hm = (int(hip_mid[0]), int(hip_mid[1]))
+    # 2. Dynamic radii (capped at 80)
+    BASE = 20
+    neck_r     = min(80, int(BASE + neck_s     * 40))
+    spine_r    = min(80, int(BASE + spine_s    * 50))
+    shoulder_r = min(80, int(BASE + shoulder_s * 35))
 
-    if neck_i > 0.08:
-        # Place neck heatmap in the true center of the neck (between nose and shoulder midpoint)
-        nose_pt = keypoints["nose"]
-        true_neck_center = (
-            int((sm[0] + nose_pt[0]) / 2),
-            int((sm[1] + nose_pt[1]) / 2)
+    # 3. Per-region opacity
+    neck_a     = 0.2 + neck_s     * 0.5
+    spine_a    = 0.2 + spine_s    * 0.5
+    shoulder_a = 0.2 + shoulder_s * 0.5
+
+    # 4. Draw each region on its own overlay and blend
+    def _blend_circle(dst, pt, r, col, a):
+        ov = dst.copy()
+        cv2.circle(ov, pt, r, col, -1)
+        dst[:] = cv2.addWeighted(ov, a, dst, 1.0 - a, 0)
+
+    _blend_circle(frame, neck_point,                    neck_r,     (0, 80,  255), neck_a)
+    _blend_circle(frame, spine_point,                   spine_r,    (0, 165, 255), spine_a)
+    _blend_circle(frame, keypoints["left_shoulder"],    shoulder_r, (0, 220, 220), shoulder_a)
+    _blend_circle(frame, keypoints["right_shoulder"],   shoulder_r, (0, 220, 220), shoulder_a)
+
+
+def initialize_heatmap_matrix(frame_shape) -> np.ndarray:
+    """
+    Stores cumulative region scores: [neck, spine, shoulders].
+    """
+    return np.zeros((3,), dtype=np.float32)
+
+
+def create_torso_mask(frame_shape, keypoints: dict) -> np.ndarray:
+    """
+    Creates a torso-only binary mask using shoulders and hips.
+    """
+    height, width = frame_shape[:2]
+    mask = np.zeros((height, width), dtype=np.uint8)
+    torso_poly = np.array(
+        [
+            keypoints["left_shoulder"],
+            keypoints["right_shoulder"],
+            keypoints["right_hip"],
+            keypoints["left_hip"],
+        ],
+        dtype=np.int32,
+    )
+    cv2.fillPoly(mask, [torso_poly], 255)
+    return mask
+
+
+def accumulate_strain_heatmap(
+    heatmap_matrix: np.ndarray,
+    keypoints: dict,
+    features: dict,
+    posture_status: str,
+    severity_score: float,
+    calib_state: dict,
+    is_calibrating: bool,
+    severity_threshold: float = 14.0,
+    decay: float = 0.90,
+    max_intensity: float = 65.0,
+) -> None:
+    """
+    Accumulates simple region scores for report circles.
+    """
+    if heatmap_matrix is None or is_calibrating:
+        return
+
+    heatmap_matrix *= decay
+
+    add_heat = posture_status != "GOOD" or severity_score >= severity_threshold
+    if not add_heat:
+        return
+
+    neck_strain = max(0.0, features["neck_angle"] - calib_state["base_neck"])
+    spine_strain = max(0.0, features["spine_angle"] - calib_state["base_spine"])
+    shoulder_strain = max(
+        0.0, features["shoulder_alignment"] - calib_state["base_shoulder"]
+    )
+
+    heatmap_matrix[0] += min(
+        severity_score * (1.0 + neck_strain / 20.0),
+        max_intensity,
+    )
+    heatmap_matrix[1] += min(
+        severity_score * (1.0 + spine_strain / 20.0),
+        max_intensity,
+    )
+    heatmap_matrix[2] += min(
+        severity_score * (1.0 + shoulder_strain / 25.0),
+        max_intensity,
+    )
+
+
+def apply_body_mask(image, torso_mask: np.ndarray):
+    """
+    Applies torso mask so heatmap is limited to body polygon.
+    """
+    return cv2.bitwise_and(image, image, mask=torso_mask)
+
+
+def generate_report_overlay(
+    base_frame,
+    keypoints: dict,
+    features: dict,
+    severity_level: str,
+):
+    """
+    Draws severity-scaled circles on the report frame — same logic as real-time view.
+    neck between shoulder_mid and nose; spine at torso center; both shoulders.
+    Color: LOW=yellow, MEDIUM=orange, HIGH=red (BGR).
+    """
+    if base_frame is None or keypoints is None or features is None:
+        return base_frame
+
+    # Points
+    sm = (int(features["shoulder_mid"][0]), int(features["shoulder_mid"][1]))
+    hm = (int(features["hip_mid"][0]),      int(features["hip_mid"][1]))
+    nose = keypoints["nose"]
+    neck_point  = (int((sm[0] + nose[0]) / 2), int((sm[1] + nose[1]) / 2))
+    spine_point = (int((sm[0] + hm[0]) / 2),   int((sm[1] + hm[1]) / 2))
+
+    # Per-region severity (0–1)
+    neck_s     = min(1.0, features["neck_angle"]         / 30.0)
+    spine_s    = min(1.0, features["spine_angle"]        / 30.0)
+    shoulder_s = min(1.0, features["shoulder_alignment"] / 50.0)
+
+    # Dynamic radii (capped at 80)
+    BASE = 20
+    neck_r     = min(80, int(BASE + neck_s     * 40))
+    spine_r    = min(80, int(BASE + spine_s    * 50))
+    shoulder_r = min(80, int(BASE + shoulder_s * 35))
+
+    # Color by overall severity level (BGR)
+    if severity_level == "HIGH":
+        neck_col = shoulder_col = (0, 0, 255)
+        spine_col = (0, 60, 255)
+    elif severity_level == "MEDIUM":
+        neck_col = shoulder_col = (0, 140, 255)
+        spine_col = (0, 100, 255)
+    else:  # LOW
+        neck_col = shoulder_col = (0, 220, 255)
+        spine_col = (0, 180, 255)
+
+    overlay = base_frame.copy()
+    cv2.circle(overlay, neck_point,                   neck_r,     neck_col,     -1)
+    cv2.circle(overlay, spine_point,                  spine_r,    spine_col,    -1)
+    cv2.circle(overlay, keypoints["left_shoulder"],   shoulder_r, shoulder_col, -1)
+    cv2.circle(overlay, keypoints["right_shoulder"],  shoulder_r, shoulder_col, -1)
+
+    return cv2.addWeighted(overlay, 0.4, base_frame, 0.6, 0)
+
+
+def render_report(
+    base_frame,
+    heat_overlay,
+    posture_status: str,
+    severity_level: str,
+    risk_level: str,
+    duration_sec: float,
+):
+    """
+    Renders a dashboard-like posture report layout.
+    """
+    if base_frame is None or heat_overlay is None:
+        return base_frame
+
+    h, w = heat_overlay.shape[:2]
+    panel_w = 420
+    canvas = np.zeros((h + 120, w + panel_w + 60, 3), dtype=np.uint8)
+    canvas[:] = (18, 18, 24)
+
+    # Main image card (left)
+    img_x, img_y = 30, 90
+    cv2.rectangle(canvas, (img_x - 6, img_y - 6), (img_x + w + 6, img_y + h + 6), (45, 45, 55), -1)
+    canvas[img_y:img_y + h, img_x:img_x + w] = heat_overlay
+
+    # Right panel
+    right_x = img_x + w + 24
+    cv2.rectangle(canvas, (right_x, img_y), (right_x + panel_w, img_y + h), (28, 28, 36), -1)
+
+    # Title and meta
+    cv2.putText(
+        canvas,
+        "POSTURE ANALYSIS REPORT",
+        (30, 50),
+        cv2.FONT_HERSHEY_DUPLEX,
+        1.05,
+        (240, 240, 245),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        canvas,
+        f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        (30, 76),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (170, 170, 185),
+        1,
+        cv2.LINE_AA,
+    )
+
+    # Summary block
+    sy = img_y + 36
+    cv2.putText(canvas, "Summary", (right_x + 20, sy), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (220, 220, 235), 2, cv2.LINE_AA)
+    severity_color = (0, 255, 255) if severity_level == "LOW" else (0, 180, 255) if severity_level == "MEDIUM" else (0, 0, 255)
+    risk_color = (0, 255, 0) if risk_level == "LOW" else (0, 255, 255) if risk_level == "MEDIUM" else (0, 0, 255)
+    posture_color = (0, 255, 0) if posture_status == "GOOD" else (0, 255, 255) if posture_status == "MODERATE" else (0, 0, 255)
+
+    lines = [
+        ("Posture", posture_status, posture_color),
+        ("Severity", severity_level, severity_color),
+        ("Risk", risk_level, risk_color),
+        ("Duration", f"{duration_sec:.1f} s", (210, 210, 220)),
+    ]
+    for idx, (label, value, color) in enumerate(lines):
+        y = sy + 36 + idx * 32
+        cv2.putText(canvas, f"{label}:", (right_x + 20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (180, 180, 195), 1, cv2.LINE_AA)
+        cv2.putText(canvas, value, (right_x + 170, y), cv2.FONT_HERSHEY_SIMPLEX, 0.68, color, 2, cv2.LINE_AA)
+
+    # Circle-size legend
+    ly = sy + 190
+    cv2.putText(canvas, "Circle Size = Strain Level", (right_x + 20, ly),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.58, (220, 220, 235), 1, cv2.LINE_AA)
+
+    legend_items = [
+        (12, (0, 220, 255), "Low"),
+        (20, (0, 140, 255), "Medium"),
+        (30, (0, 0, 255),   "High"),
+    ]
+    lx_start = right_x + 30
+    lx = lx_start
+    for r, col, label in legend_items:
+        cy_leg = ly + 30 + r
+        cv2.circle(canvas, (lx + r, cy_leg), r, col, -1)
+        cv2.putText(canvas, label, (lx, cy_leg + r + 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (170, 170, 185), 1, cv2.LINE_AA)
+        lx += r * 2 + 28
+
+
+    return canvas
+
+
+def draw_feedback_message(frame, posture_status: str, risk_level: str) -> None:
+    """
+    Real-time user feedback:
+    - RED: high risk or bad posture
+    - YELLOW: moderate posture
+    """
+    message = ""
+    color = (255, 255, 255)
+
+    if risk_level == "HIGH" or posture_status == "BAD":
+        message = "Correct your posture!"
+        color = (0, 0, 255)  # Red in BGR
+    elif posture_status == "MODERATE":
+        message = "Sit straight"
+        color = (0, 255, 255)  # Yellow in BGR
+
+    if message:
+        cv2.putText(
+            frame,
+            message,
+            (10, frame.shape[0] - 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.9,
+            color,
+            2,
+            cv2.LINE_AA,
         )
-        r = int(28 + 35 * neck_i)
-        cv2.circle(overlay, true_neck_center, r, (0, 0, 255), -1)
 
-    if spine_i > 0.08:
-        # Use the anatomical center of the torso (midpoint between shoulders and hips)
-        spine_center = (
-            int((sm[0] + hm[0]) / 2),
-            int((sm[1] + hm[1]) / 2)
-        )
-        r = int(35 + 45 * spine_i)
-        cv2.circle(overlay, spine_center, r, (0, 120, 255), -1)
 
-    if shoulder_i > 0.12:
-        r = int(22 + 28 * shoulder_i)
-        cv2.circle(overlay, keypoints["left_shoulder"], r, (0, 255, 255), -1)
-        cv2.circle(overlay, keypoints["right_shoulder"], r, (0, 255, 255), -1)
+def create_and_save_posture_report(
+    output_path: str,
+    source_frame,
+    keypoints,
+    features,
+    heatmap_matrix: np.ndarray,
+    posture_status: str,
+    severity_level: str,
+    risk_level: str,
+    duration_sec: float,
+) -> bool:
+    """
+    Builds and saves a final report image with cumulative heatmap and summary labels.
+    """
+    if source_frame is None or keypoints is None or features is None:
+        return False
 
-    cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0, frame)
+    heat_overlay = generate_report_overlay(
+        source_frame.copy(),
+        keypoints,
+        features,
+        severity_level,
+    )
+    report_img = render_report(
+        source_frame,
+        heat_overlay,
+        posture_status,
+        severity_level,
+        risk_level,
+        duration_sec,
+    )
+
+    return cv2.imwrite(output_path, report_img)
 
 
 def append_session_log(
@@ -487,10 +778,21 @@ def main() -> None:
     bad_start_time = None
     session_start = time.time()
     session_log: list = []
+    baseline_capture_done = False
+    heatmap_matrix = None
+    last_eval = {"status": "GOOD", "severity_level": "LOW", "risk_level": "LOW"}
+    baseline_state = {
+        "frame": None,
+        "keypoints": None,
+        "features": None,
+        "status": "GOOD",
+        "severity_level": "LOW",
+        "risk_level": "LOW",
+    }
     calib_state = {
         "is_calibrating": True,
         "start_time": time.time(),
-        "duration": 5.0, # 5 seconds calibration period
+        "duration": 8.0, # 8 seconds calibration period
         "neck_samples": [],
         "spine_samples": [],
         "base_neck": 10.0,
@@ -518,6 +820,8 @@ def main() -> None:
 
                 keypoints = extract_posture_keypoints(pose_landmarks, frame.shape)
                 features = compute_posture_features(keypoints)
+                if heatmap_matrix is None:
+                    heatmap_matrix = initialize_heatmap_matrix(frame.shape)
                 features["neck_angle"] = smooth_value(
                     neck_angle_history, features["neck_angle"]
                 )
@@ -538,6 +842,11 @@ def main() -> None:
                 current_time = time.time()
 
                 is_calibrating = update_calibration(features, calib_state, current_time)
+                if is_calibrating and (not baseline_capture_done):
+                    baseline_capture_done = True
+                    baseline_state["frame"] = frame.copy()
+                    baseline_state["keypoints"] = dict(keypoints)
+                    baseline_state["features"] = dict(features)
 
                 if is_calibrating:
                     status = "CALIBRATING"
@@ -556,8 +865,8 @@ def main() -> None:
                         frame,
                         keypoints,
                         features,
-                        features["shoulder_mid"],
-                        features["hip_mid"],
+                        status,
+                        severity_level,
                     )
                     append_session_log(
                         session_log,
@@ -568,6 +877,18 @@ def main() -> None:
                         severity_score,
                         risk_level,
                     )
+                    accumulate_strain_heatmap(
+                        heatmap_matrix,
+                        keypoints,
+                        features,
+                        status,
+                        severity_score,
+                        calib_state,
+                        is_calibrating,
+                    )
+                    last_eval["status"] = status
+                    last_eval["severity_level"] = severity_level
+                    last_eval["risk_level"] = risk_level
 
                 draw_posture_overlay(
                     frame,
@@ -581,6 +902,8 @@ def main() -> None:
                     severity_score,
                     calib_state,
                 )
+                if not is_calibrating:
+                    draw_feedback_message(frame, status, risk_level)
 
                 if not is_calibrating:
                     print(
@@ -601,6 +924,22 @@ def main() -> None:
             cv2.imshow("Real-Time Posture Analysis", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
+
+    report_saved = create_and_save_posture_report(
+        "posture_report.png",
+        baseline_state["frame"],
+        baseline_state["keypoints"],
+        baseline_state["features"],
+        heatmap_matrix,
+        last_eval["status"],
+        last_eval["severity_level"],
+        last_eval["risk_level"],
+        time.time() - session_start,
+    )
+    if report_saved:
+        print("Saved report image: posture_report.png")
+    else:
+        print("Report image not saved (no valid posture frame captured).")
 
     print(f"Session log entries: {len(session_log)} (list stored in memory during run).")
     cap.release()
